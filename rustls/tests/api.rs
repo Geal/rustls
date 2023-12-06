@@ -4887,3 +4887,188 @@ fn test_debug_server_name_from_string() {
         "DnsName(\"a.com\")"
     )
 }
+
+#[cfg(all(feature = "ring", feature = "aws_lc_rs"))]
+#[test]
+fn test_explicit_provider_selection() {
+    let client_config = finish_client_config(
+        KeyType::Rsa,
+        rustls::ClientConfig::builder_with_provider(
+            rustls::crypto::ring::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap(),
+    );
+    let server_config = finish_server_config(
+        KeyType::Rsa,
+        rustls::ServerConfig::builder_with_provider(
+            rustls::crypto::aws_lc_rs::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap(),
+    );
+
+    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+    do_handshake(&mut client, &mut server);
+}
+
+#[derive(Debug)]
+struct FaultyRandom {
+    // when empty, `fill_random` requests return `GetRandomFailed`
+    rand_queue: Mutex<&'static [u8]>,
+}
+
+impl rustls::crypto::SecureRandom for FaultyRandom {
+    fn fill(&self, output: &mut [u8]) -> Result<(), rustls::crypto::GetRandomFailed> {
+        let mut queue = self.rand_queue.lock().unwrap();
+
+        println!(
+            "fill_random request for {} bytes (got {})",
+            output.len(),
+            queue.len()
+        );
+
+        if queue.len() < output.len() {
+            return Err(rustls::crypto::GetRandomFailed);
+        }
+
+        let fixed_output = &queue[..output.len()];
+        output.copy_from_slice(fixed_output);
+        *queue = &queue[output.len()..];
+        Ok(())
+    }
+}
+
+#[test]
+fn test_client_construction_fails_if_random_source_fails_in_first_request() {
+    static FAULTY_RANDOM: FaultyRandom = FaultyRandom {
+        rand_queue: Mutex::new(b""),
+    };
+
+    let client_config = finish_client_config(
+        KeyType::Rsa,
+        rustls::ClientConfig::builder_with_provider(
+            CryptoProvider {
+                secure_random: &FAULTY_RANDOM,
+                ..provider::default_provider()
+            }
+            .into(),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap(),
+    );
+
+    assert_eq!(
+        ClientConnection::new(Arc::new(client_config), server_name("localhost")).unwrap_err(),
+        Error::FailedToGetRandomBytes
+    );
+}
+
+#[test]
+fn test_client_construction_fails_if_random_source_fails_in_second_request() {
+    static FAULTY_RANDOM: FaultyRandom = FaultyRandom {
+        rand_queue: Mutex::new(b"nice random number generator huh"),
+    };
+
+    let client_config = finish_client_config(
+        KeyType::Rsa,
+        rustls::ClientConfig::builder_with_provider(
+            CryptoProvider {
+                secure_random: &FAULTY_RANDOM,
+                ..provider::default_provider()
+            }
+            .into(),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap(),
+    );
+
+    assert_eq!(
+        ClientConnection::new(Arc::new(client_config), server_name("localhost")).unwrap_err(),
+        Error::FailedToGetRandomBytes
+    );
+}
+
+#[test]
+fn test_client_construction_requires_64_bytes_of_random_material() {
+    static FAULTY_RANDOM: FaultyRandom = FaultyRandom {
+        rand_queue: Mutex::new(
+            b"nice random number generator !!!\
+                                 it's really not very good is it?",
+        ),
+    };
+
+    let client_config = finish_client_config(
+        KeyType::Rsa,
+        rustls::ClientConfig::builder_with_provider(
+            CryptoProvider {
+                secure_random: &FAULTY_RANDOM,
+                ..provider::default_provider()
+            }
+            .into(),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap(),
+    );
+
+    ClientConnection::new(Arc::new(client_config), server_name("localhost"))
+        .expect("check how much random material ClientConnection::new consumes");
+}
+
+#[cfg(feature = "tls12")]
+#[test]
+fn test_client_removes_tls12_session_if_server_sends_undecryptable_first_message() {
+    fn inject_corrupt_finished_message(msg: &mut Message) -> Altered {
+        if let MessagePayload::ChangeCipherSpec(_) = msg.payload {
+            // interdict "real" ChangeCipherSpec with its encoding, plus a faulty encrypted Finished.
+            let mut raw_change_cipher_spec = [0x14u8, 0x03, 0x03, 0x00, 0x01, 0x01].to_vec();
+            let mut corrupt_finished = [0x16, 0x03, 0x03, 0x00, 0x28].to_vec();
+            corrupt_finished.extend([0u8; 0x28]);
+
+            let mut both = vec![];
+            both.append(&mut raw_change_cipher_spec);
+            both.append(&mut corrupt_finished);
+
+            Altered::Raw(both)
+        } else {
+            Altered::InPlace
+        }
+    }
+
+    let mut client_config =
+        make_client_config_with_versions(KeyType::Rsa, &[&rustls::version::TLS12]);
+    let storage = Arc::new(ClientStorage::new());
+    client_config.resumption = Resumption::store(storage.clone());
+    let client_config = Arc::new(client_config);
+    let server_config = Arc::new(make_server_config(KeyType::Rsa));
+
+    // successful handshake to allow resumption
+    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+    do_handshake(&mut client, &mut server);
+
+    // resumption
+    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+    transfer(&mut client, &mut server);
+    server.process_new_packets().unwrap();
+    let mut client = client.into();
+    transfer_altered(
+        &mut server.into(),
+        inject_corrupt_finished_message,
+        &mut client,
+    );
+
+    // discard storage operations up to this point, to observe the one we want to test for.
+    storage.ops_and_reset();
+
+    // client cannot decrypt faulty Finished, and deletes saved session in case
+    // server resumption is buggy.
+    assert_eq!(
+        Some(Error::DecryptError),
+        client.process_new_packets().err()
+    );
+
+    assert!(matches!(
+        storage.ops()[0],
+        ClientStorageOp::RemoveTls12Session(_)
+    ));
+}
